@@ -90,8 +90,10 @@ class indexed_free_list {
 
   void erase_indexed(block_type const& b)
   {
-    by_addr_.erase(b.pointer());
+    // b may refer to a value in by_addr_. Keep the size index in sync before
+    // erasing the map entry that owns that value.
     by_size_.erase({b.size(), b.pointer()});
+    by_addr_.erase(b.pointer());
   }
 
   // Address-ordered: coalescing neighbor lookup.

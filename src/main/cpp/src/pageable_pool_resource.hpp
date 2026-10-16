@@ -430,7 +430,7 @@ static_assert(
   cuda::mr::synchronous_resource_with<pageable_pool_resource_t<detail::indexed_free_list>,
                                       cuda::mr::host_accessible>);
 
-// Default pool: the PR's coalescing free list (policy-identical to rmm::pool_memory_resource).
-using pageable_pool_resource = pageable_pool_resource_t<rmm::mr::detail::coalescing_free_list>;
+// Use the indexed free list to keep allocation and coalescing efficient as the pool fragments.
+using pageable_pool_resource = pageable_pool_resource_t<detail::indexed_free_list>;
 
 }  // namespace spark_rapids_jni
