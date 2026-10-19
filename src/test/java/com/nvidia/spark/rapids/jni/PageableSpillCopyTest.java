@@ -27,13 +27,193 @@ import ai.rapids.cudf.RmmAllocationMode;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class PageableSpillCopyTest {
+  @Test
+  public void rejectedLaterChunkDrainsAcceptedChunk() throws Exception {
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.threads", "1");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.chunk.bytes", "4096");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.registered.buffers", "true");
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
+    CountDownLatch releaseWorker = new CountDownLatch(1);
+    Thread copier = null;
+    java.lang.reflect.Field field = PageableMemoryPool.class.getDeclaredField(
+        "stagedCopyExecutor");
+    field.setAccessible(true);
+    ExecutorService original = null;
+    try {
+      PageableMemoryPool.initialize(8192, 1);
+      PageableMemoryPool.isInitialized();
+      original = (ExecutorService) field.get(null);
+      CountDownLatch workerBlocked = new CountDownLatch(1);
+      original.submit(() -> {
+        workerBlocked.countDown();
+        try {
+          releaseWorker.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      });
+      assertTrue(workerBlocked.await(5, TimeUnit.SECONDS));
+      AtomicInteger submissions = new AtomicInteger();
+      CountDownLatch accepted = new CountDownLatch(1);
+      ExecutorService delegate = original;
+      ExecutorService rejecting = (ExecutorService) java.lang.reflect.Proxy.newProxyInstance(
+          ExecutorService.class.getClassLoader(), new Class<?>[] {ExecutorService.class},
+          (proxy, method, args) -> {
+            if ("submit".equals(method.getName()) && submissions.incrementAndGet() == 2) {
+              throw new RejectedExecutionException("injected second chunk rejection");
+            }
+            Object result = method.invoke(delegate, args);
+            if ("submit".equals(method.getName())) {
+              accepted.countDown();
+            }
+            return result;
+          });
+      field.set(null, rejecting);
+      AtomicReference<Throwable> failure = new AtomicReference<>();
+      try (DeviceMemoryBuffer device = DeviceMemoryBuffer.allocate(8192);
+           HostMemoryBuffer host = PageableMemoryPool.allocateRawForDeviceToHost(8192)) {
+        copier = new Thread(() -> {
+          try {
+            PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 8192,
+                Cuda.DEFAULT_STREAM);
+          } catch (Throwable t) {
+            failure.set(t);
+          }
+        });
+        copier.start();
+        assertTrue(accepted.await(5, TimeUnit.SECONDS));
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (submissions.get() < 2 && System.nanoTime() < deadline) {
+          Thread.yield();
+        }
+        assertEquals(2, submissions.get());
+        assertTrue(copier.isAlive(), "copy returned before accepted chunk finished");
+        releaseWorker.countDown();
+        copier.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse(copier.isAlive());
+        assertTrue(failure.get() instanceof RejectedExecutionException,
+            () -> "unexpected failure: " + failure.get());
+      }
+    } finally {
+      releaseWorker.countDown();
+      if (copier != null) {
+        copier.join(TimeUnit.SECONDS.toMillis(5));
+      }
+      if (original != null) {
+        field.set(null, original);
+      }
+      PageableMemoryPool.shutdown();
+      Rmm.shutdown();
+      System.clearProperty("ai.rapids.cudf.pageable.staged.copy.threads");
+      System.clearProperty("ai.rapids.cudf.pageable.staged.copy.chunk.bytes");
+      System.clearProperty("ai.rapids.cudf.pageable.staged.copy.registered.buffers");
+    }
+  }
+
+  @Test
+  public void shutdownDrainsQueuedDeviceToHostCopy() throws Exception {
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.threads", "1");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.chunk.bytes", "4096");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.registered.buffers", "true");
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
+    CountDownLatch releaseWorker = new CountDownLatch(1);
+    AtomicReference<Throwable> copyFailure = new AtomicReference<>();
+    AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
+    Thread copier = null;
+    Thread shutdown = null;
+    try {
+      PageableMemoryPool.initialize(8192, 1);
+      PageableMemoryPool.isInitialized();
+      java.lang.reflect.Field field = PageableMemoryPool.class.getDeclaredField(
+          "stagedCopyExecutor");
+      field.setAccessible(true);
+      ThreadPoolExecutor workers = (ThreadPoolExecutor) field.get(null);
+      CountDownLatch workerBlocked = new CountDownLatch(1);
+      workers.submit(() -> {
+        workerBlocked.countDown();
+        try {
+          releaseWorker.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      });
+      assertTrue(workerBlocked.await(5, TimeUnit.SECONDS));
+      try (DeviceMemoryBuffer device = DeviceMemoryBuffer.allocate(4096);
+           HostMemoryBuffer host = PageableMemoryPool.allocateRawForDeviceToHost(4096)) {
+        copier = new Thread(() -> {
+          try {
+            PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+                Cuda.DEFAULT_STREAM);
+          } catch (Throwable t) {
+            copyFailure.set(t);
+          }
+        });
+        copier.start();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (workers.getQueue().isEmpty() && System.nanoTime() < deadline) {
+          Thread.yield();
+        }
+        assertFalse(workers.getQueue().isEmpty(), "copy was not queued");
+        shutdown = new Thread(() -> {
+          try {
+            PageableMemoryPool.shutdown();
+          } catch (Throwable t) {
+            shutdownFailure.set(t);
+          }
+        });
+        shutdown.start();
+        java.lang.reflect.Field lifecycleField = PageableMemoryPool.class.getDeclaredField(
+            "stagedCopyLifecycleLock");
+        lifecycleField.setAccessible(true);
+        ReentrantReadWriteLock lifecycle =
+            (ReentrantReadWriteLock) lifecycleField.get(null);
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!lifecycle.hasQueuedThread(shutdown) && System.nanoTime() < deadline) {
+          Thread.yield();
+        }
+        assertTrue(lifecycle.hasQueuedThread(shutdown), "shutdown did not wait for copy lease");
+        assertTrue(shutdown.isAlive(), "shutdown returned while copy was queued");
+        releaseWorker.countDown();
+        copier.join(TimeUnit.SECONDS.toMillis(5));
+        shutdown.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse(copier.isAlive());
+        assertFalse(shutdown.isAlive());
+        assertNull(copyFailure.get());
+        assertNull(shutdownFailure.get());
+      }
+    } finally {
+      releaseWorker.countDown();
+      if (copier != null) {
+        copier.join(TimeUnit.SECONDS.toMillis(5));
+      }
+      if (shutdown != null) {
+        shutdown.join(TimeUnit.SECONDS.toMillis(5));
+      }
+      PageableMemoryPool.shutdown();
+      Rmm.shutdown();
+      System.clearProperty("ai.rapids.cudf.pageable.staged.copy.threads");
+      System.clearProperty("ai.rapids.cudf.pageable.staged.copy.chunk.bytes");
+      System.clearProperty("ai.rapids.cudf.pageable.staged.copy.registered.buffers");
+    }
+  }
+
   @Test
   public void roundTripWithOffsetsAndMultipleChunks() {
     roundTrip(false, 2, false);
