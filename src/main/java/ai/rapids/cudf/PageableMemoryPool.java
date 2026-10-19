@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -66,6 +67,10 @@ public final class PageableMemoryPool implements AutoCloseable {
   private static long stagedCopyChunkSize = 0;
   private static long stagedCopyMinSize = 0;
   private static volatile Throwable asyncD2HFailure = null;
+  // Package tests inject failures at the two native boundaries that the CUDA fault injector
+  // cannot replace (Runtime API return codes are not supported by that injector).
+  private static volatile Runnable beforeRegisteredStagingAllocation = null;
+  private static volatile BooleanSupplier asyncD2HEventQueryOverride = null;
   private static final AtomicLong stagedCopyCallCount = new AtomicLong();
   private static final AtomicLong stagedD2HCalls = new AtomicLong();
   private static final AtomicLong stagedD2HBytes = new AtomicLong();
@@ -127,6 +132,14 @@ public final class PageableMemoryPool implements AutoCloseable {
   private static native void setStagingBuffer(long address, long size);
 
   private static native long allocateRegisteredStagingBuffer(long size);
+
+  private static long allocateStagingBuffer(long size) {
+    Runnable hook = beforeRegisteredStagingAllocation;
+    if (hook != null) {
+      hook.run();
+    }
+    return allocateRegisteredStagingBuffer(size);
+  }
 
   private static native void freeRegisteredStagingBuffer(long address);
 
@@ -343,7 +356,7 @@ public final class PageableMemoryPool implements AutoCloseable {
       for (int i = 0; i < stagedCopyThreads; i++) {
         long address;
         if (registeredBuffers) {
-          address = allocateRegisteredStagingBuffer(stagedCopyChunkSize);
+          address = allocateStagingBuffer(stagedCopyChunkSize);
           registeredStagedCopyBuffers[i] = address;
         } else {
           HostMemoryBuffer buffer = PinnedMemoryPool.tryAllocate(stagedCopyChunkSize);
@@ -362,11 +375,20 @@ public final class PageableMemoryPool implements AutoCloseable {
       if (asyncStagedD2H) {
         initializeAsyncD2HSlots();
       }
-    } catch (RuntimeException e) {
-      stopAsyncD2HSlots();
-      stagedCopyExecutor.shutdownNow();
-      stagedCopyExecutor = null;
-      closeStagedCopyBuffers();
+    } catch (RuntimeException | Error e) {
+      // Submitted warmup tasks still use their buffers. Drain them before unregistration.
+      try {
+        waitForStagedCopies(warmupFutures);
+      } catch (RuntimeException drainFailure) {
+        if (drainFailure != e) {
+          e.addSuppressed(drainFailure);
+        }
+      } finally {
+        stopAsyncD2HSlots();
+        stagedCopyExecutor.shutdownNow();
+        stagedCopyExecutor = null;
+        closeStagedCopyBuffers();
+      }
       throw e;
     }
     }
@@ -439,7 +461,7 @@ public final class PageableMemoryPool implements AutoCloseable {
     List<AsyncD2HSlot> slots = new ArrayList<>(asyncD2HSlotCount);
     try {
       for (int i = 0; i < asyncD2HSlotCount; i++) {
-        long address = allocateRegisteredStagingBuffer(stagedCopyChunkSize);
+        long address = allocateStagingBuffer(stagedCopyChunkSize);
         AsyncD2HSlot slot = new AsyncD2HSlot(address);
         slots.add(slot);
         free.add(slot);
@@ -495,7 +517,9 @@ public final class PageableMemoryPool implements AutoCloseable {
         asyncD2HCompletionPolls.incrementAndGet();
         boolean ready;
         try {
-          ready = copy.slot.done.hasCompleted();
+          BooleanSupplier queryOverride = asyncD2HEventQueryOverride;
+          ready = queryOverride == null ? copy.slot.done.hasCompleted() :
+              queryOverride.getAsBoolean();
         } catch (RuntimeException | Error t) {
           active.remove(i);
           failAsyncD2HCopy(copy, t, true);

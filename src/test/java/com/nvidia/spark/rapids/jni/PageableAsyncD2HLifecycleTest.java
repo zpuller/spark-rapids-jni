@@ -34,6 +34,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 
 import org.junit.jupiter.api.Test;
 
@@ -45,6 +47,91 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class PageableAsyncD2HLifecycleTest {
+  @Test
+  public void eventQueryFailureDrainsAndReturnsSlot() throws Exception {
+    configureAsyncPool(1);
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
+    Field queryField = field("asyncD2HEventQueryOverride");
+    try {
+      PageableMemoryPool.initialize(8192, 1);
+      assertTrue(PageableMemoryPool.isInitialized());
+      AtomicInteger queries = new AtomicInteger();
+      queryField.set(null, (BooleanSupplier) () -> {
+        queries.incrementAndGet();
+        throw new IllegalStateException("injected CUDA event query failure");
+      });
+      ArrayBlockingQueue<?> free = (ArrayBlockingQueue<?>) field("freeAsyncD2HSlots").get(null);
+      try (DeviceMemoryBuffer device = DeviceMemoryBuffer.allocate(4096);
+           HostMemoryBuffer host = PageableMemoryPool.allocateRawForDeviceToHost(4096)) {
+        RuntimeException failure = assertThrows(RuntimeException.class,
+            () -> PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+                Cuda.DEFAULT_STREAM));
+        assertTrue(hasCause(failure, IllegalStateException.class));
+        assertTrue(queries.get() > 0);
+        assertEquals(1, free.size(), "failed query did not return the drained slot");
+        assertThrows(IllegalStateException.class,
+            () -> PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+                Cuda.DEFAULT_STREAM));
+      }
+    } finally {
+      queryField.set(null, null);
+      PageableMemoryPool.shutdown();
+      Rmm.shutdown();
+      clearAsyncPoolConfig();
+    }
+  }
+
+  @Test
+  public void slotAllocationFailureCleansPartialInitializationAndCanRetry() throws Exception {
+    configureAsyncPool(2);
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
+    Field allocationField = field("beforeRegisteredStagingAllocation");
+    try {
+      AtomicInteger allocations = new AtomicInteger();
+      allocationField.set(null, (Runnable) () -> {
+        if (allocations.incrementAndGet() == 3) {
+          throw new IllegalStateException("injected registered allocation failure");
+        }
+      });
+      assertThrows(IllegalStateException.class, () -> PageableMemoryPool.initialize(8192, 1));
+      assertEquals(3, allocations.get());
+      assertEquals(null, field("stagedCopyExecutor").get(null));
+      assertEquals(null, field("asyncD2HSlots").get(null));
+      allocationField.set(null, null);
+      PageableMemoryPool.initialize(8192, 1);
+      assertTrue(PageableMemoryPool.isInitialized());
+      assertEquals(2, ((List<?>) field("asyncD2HSlots").get(null)).size());
+    } finally {
+      allocationField.set(null, null);
+      PageableMemoryPool.shutdown();
+      Rmm.shutdown();
+      clearAsyncPoolConfig();
+    }
+  }
+
+  private static Field field(String name) throws NoSuchFieldException {
+    Field result = PageableMemoryPool.class.getDeclaredField(name);
+    result.setAccessible(true);
+    return result;
+  }
+
+  private static void configureAsyncPool(int slots) {
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.threads", "1");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.chunk.bytes", "4096");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.registered.buffers", "true");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.async.d2h", "true");
+    System.setProperty("ai.rapids.cudf.pageable.staged.copy.async.d2h.slots",
+        Integer.toString(slots));
+  }
+
+  private static void clearAsyncPoolConfig() {
+    System.clearProperty("ai.rapids.cudf.pageable.staged.copy.threads");
+    System.clearProperty("ai.rapids.cudf.pageable.staged.copy.chunk.bytes");
+    System.clearProperty("ai.rapids.cudf.pageable.staged.copy.registered.buffers");
+    System.clearProperty("ai.rapids.cudf.pageable.staged.copy.async.d2h");
+    System.clearProperty("ai.rapids.cudf.pageable.staged.copy.async.d2h.slots");
+  }
+
   @Test
   public void moreCallersThanSlotsDrainAndRecoverCapacity() throws Exception {
     System.setProperty("ai.rapids.cudf.pageable.staged.copy.threads", "1");
