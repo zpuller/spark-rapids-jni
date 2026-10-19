@@ -497,9 +497,8 @@ public final class PageableMemoryPool implements AutoCloseable {
         try {
           ready = copy.slot.done.hasCompleted();
         } catch (RuntimeException | Error t) {
-          asyncD2HFailure = t;
-          copy.future.completeExceptionally(t);
           active.remove(i);
+          failAsyncD2HCopy(copy, t, true);
           completed = true;
           continue;
         }
@@ -530,8 +529,7 @@ public final class PageableMemoryPool implements AutoCloseable {
               }
             });
           } catch (RuntimeException | Error t) {
-            asyncD2HFailure = t;
-            copy.future.completeExceptionally(t);
+            failAsyncD2HCopy(copy, t, false);
           }
         }
       }
@@ -539,6 +537,31 @@ public final class PageableMemoryPool implements AutoCloseable {
         LockSupport.parkNanos(active.isEmpty() ? 100_000L : 20_000L);
       }
     }
+  }
+
+  private static void failAsyncD2HCopy(PendingAsyncD2H copy, Throwable failure,
+      boolean streamMayBeActive) {
+    boolean drained = !streamMayBeActive;
+    if (streamMayBeActive) {
+      // A failed event query does not establish that the DMA is finished.
+      try {
+        copy.slot.stream.sync();
+        drained = true;
+      } catch (RuntimeException | Error syncFailure) {
+        failure.addSuppressed(syncFailure);
+        try {
+          Cuda.deviceSynchronize();
+          drained = true;
+        } catch (RuntimeException | Error deviceFailure) {
+          failure.addSuppressed(deviceFailure);
+        }
+      }
+    }
+    asyncD2HFailure = failure;
+    if (drained) {
+      freeAsyncD2HSlots.add(copy.slot);
+    }
+    copy.future.completeExceptionally(failure);
   }
 
   private static void copyFromDeviceAsync(long dst, long src, long length, Cuda.Event ready) {
@@ -560,6 +583,11 @@ public final class PageableMemoryPool implements AutoCloseable {
             }
             slot = free.poll(100, TimeUnit.MILLISECONDS);
           } while (slot == null);
+          if (asyncD2HFailure != null) {
+            free.add(slot);
+            throw new IllegalStateException("Asynchronous staged D2H poller failed",
+                asyncD2HFailure);
+          }
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
           throw new RuntimeException("Interrupted while waiting for a D2H staging buffer", e);
