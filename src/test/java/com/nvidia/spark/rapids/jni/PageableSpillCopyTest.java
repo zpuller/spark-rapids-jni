@@ -229,16 +229,6 @@ public class PageableSpillCopyTest {
     roundTrip(true, 4, true);
   }
 
-  private long stagedCalls() {
-    try {
-      java.lang.reflect.Field field = PageableMemoryPool.class.getDeclaredField("stagedCopyCallCount");
-      field.setAccessible(true);
-      return ((java.util.concurrent.atomic.AtomicLong) field.get(null)).get();
-    } catch (ReflectiveOperationException e) {
-      throw new AssertionError(e);
-    }
-  }
-
   private void roundTrip(boolean asyncD2H, int slots, boolean registeredBuffers) {
     System.setProperty("ai.rapids.cudf.pageable.staged.copy.async.d2h",
         Boolean.toString(asyncD2H));
@@ -267,25 +257,19 @@ public class PageableSpillCopyTest {
         try (HostMemoryBuffer staged =
                  PageableMemoryPool.tryAllocateForDeviceToHost(length)) {
           assertNotNull(staged);
-          long callsBefore = stagedCalls();
           staged.copyFromDeviceBufferAsync(device, Cuda.DEFAULT_STREAM);
-          assertEquals(callsBefore + 1, stagedCalls());
           byte[] automatic = new byte[length];
           staged.getBytes(automatic, 0, 0, length);
           assertArrayEquals(expected, automatic);
         }
-        long callsBefore = stagedCalls();
         PageableMemoryPool.copyDeviceToPageableHost(output, 0, device, 0, length,
             Cuda.DEFAULT_STREAM);
-        assertEquals(callsBefore + 1, stagedCalls());
         byte[] rawExplicit = new byte[length];
         output.getBytes(rawExplicit, 0, 0, length);
         assertArrayEquals(expected, rawExplicit);
         try (HostMemoryBuffer raw = PageableMemoryPool.allocateRawForDeviceToHost(length)) {
           assertFalse(PageableMemoryPool.isPageablePoolBuffer(raw));
-          callsBefore = stagedCalls();
           raw.copyFromDeviceBufferAsync(device, Cuda.DEFAULT_STREAM);
-          assertEquals(callsBefore + 1, stagedCalls());
           byte[] rawAutomatic = new byte[length];
           raw.getBytes(rawAutomatic, 0, 0, length);
           assertArrayEquals(expected, rawAutomatic);

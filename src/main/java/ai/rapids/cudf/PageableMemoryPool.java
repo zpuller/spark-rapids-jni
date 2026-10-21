@@ -42,6 +42,9 @@ public final class PageableMemoryPool implements AutoCloseable {
   private static final Logger log = LoggerFactory.getLogger(PageableMemoryPool.class);
   private static final boolean TRACE_STAGED_COPY_CHUNKS = Boolean.getBoolean(
       "ai.rapids.cudf.pageable.staged.copy.trace.chunks");
+  // Read once at class initialization so disabled copy paths avoid per-chunk property lookups.
+  private static final boolean STAGED_COPY_STATS_ENABLED = Boolean.getBoolean(
+      "ai.rapids.cudf.pageable.staged.copy.stats.log.enabled");
 
   // These static fields should only ever be accessed when class-synchronized.
   // Do NOT use singleton_ directly!  Use the getSingleton accessor instead.
@@ -114,7 +117,10 @@ public final class PageableMemoryPool implements AutoCloseable {
 
   static {
     NativeDepsLoader.loadNativeDeps();
+    setStagedCopyStatsEnabled(STAGED_COPY_STATS_ENABLED);
   }
+
+  private static native void setStagedCopyStatsEnabled(boolean enabled);
 
   private static native long newPageablePoolMemoryResource(long poolSize, int pretouchThreads,
                                                            boolean numaBind, boolean thpDeny);
@@ -525,7 +531,9 @@ public final class PageableMemoryPool implements AutoCloseable {
       boolean completed = false;
       for (int i = active.size() - 1; i >= 0; i--) {
         PendingAsyncD2H copy = active.get(i);
-        asyncD2HCompletionPolls.incrementAndGet();
+        if (STAGED_COPY_STATS_ENABLED) {
+          asyncD2HCompletionPolls.incrementAndGet();
+        }
         boolean ready;
         try {
           BooleanSupplier queryOverride = asyncD2HEventQueryOverride;
@@ -540,14 +548,23 @@ public final class PageableMemoryPool implements AutoCloseable {
         if (ready) {
           active.remove(i);
           completed = true;
-          long queuedAt = System.nanoTime();
+          long queuedAt = (STAGED_COPY_STATS_ENABLED || TRACE_STAGED_COPY_CHUNKS) ?
+              System.nanoTime() : 0;
           try {
             stagedCopyExecutor.execute(() -> {
-              long queueNs = System.nanoTime() - queuedAt;
-              stagedCopyQueueNs.addAndGet(queueNs);
-              updateMax(stagedCopyMaxQueueNs, queueNs);
-              long activeWorkers = stagedCopyWorkerActive.incrementAndGet();
-              updateMax(stagedCopyMaxWorkerActive, activeWorkers);
+              long queueNs = (STAGED_COPY_STATS_ENABLED || TRACE_STAGED_COPY_CHUNKS) ?
+                System.nanoTime() - queuedAt : 0;
+              if (STAGED_COPY_STATS_ENABLED) {
+                stagedCopyQueueNs.addAndGet(queueNs);
+              }
+              if (STAGED_COPY_STATS_ENABLED) {
+                updateMax(stagedCopyMaxQueueNs, queueNs);
+              }
+              long activeWorkers = STAGED_COPY_STATS_ENABLED ?
+                  stagedCopyWorkerActive.incrementAndGet() : 0;
+              if (STAGED_COPY_STATS_ENABLED) {
+                updateMax(stagedCopyMaxWorkerActive, activeWorkers);
+              }
               Throwable failure = null;
               try (NvtxRange range = new NvtxRange("asyncStagedD2HHostCopy", NvtxColor.YELLOW)) {
                 stagedHostCopy(copy.destination, copy.slot.address, copy.size);
@@ -560,7 +577,9 @@ public final class PageableMemoryPool implements AutoCloseable {
                 } else {
                   copy.future.completeExceptionally(failure);
                 }
-                stagedCopyWorkerActive.decrementAndGet();
+                if (STAGED_COPY_STATS_ENABLED) {
+                  stagedCopyWorkerActive.decrementAndGet();
+                }
               }
             });
           } catch (RuntimeException | Error t) {
@@ -616,12 +635,12 @@ public final class PageableMemoryPool implements AutoCloseable {
     ArrayBlockingQueue<AsyncD2HSlot> free = freeAsyncD2HSlots;
     BlockingQueue<PendingAsyncD2H> pending = pendingAsyncD2H;
     List<Future<?>> futures = new ArrayList<>();
-    long submitStart = System.nanoTime();
+    long submitStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
     long offset = 0;
     try {
       while (offset < length) {
         long chunk = Math.min(stagedCopyChunkSize, length - offset);
-        long slotWaitStart = System.nanoTime();
+        long slotWaitStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
         AsyncD2HSlot slot;
         try {
           do {
@@ -640,9 +659,13 @@ public final class PageableMemoryPool implements AutoCloseable {
           Thread.currentThread().interrupt();
           throw new RuntimeException("Interrupted while waiting for a D2H staging buffer", e);
         }
-        long slotWait = System.nanoTime() - slotWaitStart;
-        asyncD2HSlotWaitNs.addAndGet(slotWait);
-        updateMax(asyncD2HMaxSlotWaitNs, slotWait);
+        long slotWait = STAGED_COPY_STATS_ENABLED ? System.nanoTime() - slotWaitStart : 0;
+        if (STAGED_COPY_STATS_ENABLED) {
+          asyncD2HSlotWaitNs.addAndGet(slotWait);
+        }
+        if (STAGED_COPY_STATS_ENABLED) {
+          updateMax(asyncD2HMaxSlotWaitNs, slotWait);
+        }
         CompletableFuture<Void> future = new CompletableFuture<>();
         try {
           slot.stream.waitOn(ready);
@@ -661,13 +684,19 @@ public final class PageableMemoryPool implements AutoCloseable {
           throw t;
         }
         offset += chunk;
-        stagedCopyChunks.incrementAndGet();
+        if (STAGED_COPY_STATS_ENABLED) {
+          stagedCopyChunks.incrementAndGet();
+        }
       }
     } finally {
-      stagedCopySubmitNs.addAndGet(System.nanoTime() - submitStart);
-      long waitStart = System.nanoTime();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySubmitNs.addAndGet(System.nanoTime() - submitStart);
+      }
+      long waitStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
       waitForStagedCopies(futures);
-      stagedCopyWaitNs.addAndGet(System.nanoTime() - waitStart);
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyWaitNs.addAndGet(System.nanoTime() - waitStart);
+      }
     }
   }
 
@@ -802,49 +831,71 @@ public final class PageableMemoryPool implements AutoCloseable {
     }
     if (!explicitStage && (Boolean.getBoolean("ai.rapids.cudf.pageable.staged.copy.disabled") ||
         Boolean.getBoolean("ai.rapids.cudf.pageable.staged.copy.d2h.disabled"))) {
-      stagedCopySkippedDisabledCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedDisabledCount.incrementAndGet();
+      }
       return false;
     }
     if (!explicitStage && !isPageablePoolBuffer(dst)) {
-      stagedCopySkippedNonPoolCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedNonPoolCount.incrementAndGet();
+      }
       return false;
     }
     if (!explicitStage && length < stagedCopyMinSize) {
-      stagedCopySkippedSmallCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedSmallCount.incrementAndGet();
+      }
       return false;
     }
     ExecutorService executor = stagedCopyExecutor;
     if (executor == null) {
-      stagedCopySkippedNoExecutorCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedNoExecutorCount.incrementAndGet();
+      }
       return false;
     }
-    long totalStart = System.nanoTime();
-    long inFlight = stagedCopyInFlight.incrementAndGet();
-    updateMax(stagedCopyMaxInFlight, inFlight);
-    long callNumber = stagedCopyCallCount.incrementAndGet();
-    stagedD2HCalls.incrementAndGet();
-    stagedD2HBytes.addAndGet(length);
-    stagedCopyBytes.addAndGet(length);
-    updateMax(stagedCopyMaxBytes, length);
+    long totalStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
+    long inFlight = STAGED_COPY_STATS_ENABLED ? stagedCopyInFlight.incrementAndGet() : 0;
+    if (STAGED_COPY_STATS_ENABLED) {
+      updateMax(stagedCopyMaxInFlight, inFlight);
+    }
+    long callNumber = STAGED_COPY_STATS_ENABLED ? stagedCopyCallCount.incrementAndGet() : 0;
+    if (STAGED_COPY_STATS_ENABLED) {
+      stagedD2HCalls.incrementAndGet();
+    }
+    if (STAGED_COPY_STATS_ENABLED) {
+      stagedD2HBytes.addAndGet(length);
+    }
+    if (STAGED_COPY_STATS_ENABLED) {
+      stagedCopyBytes.addAndGet(length);
+    }
+    if (STAGED_COPY_STATS_ENABLED) {
+      updateMax(stagedCopyMaxBytes, length);
+    }
     Cuda.Event ready = null;
     NvtxRange stagedRange = null;
     try {
       ready = new Cuda.Event(false, true);
       stagedRange = new NvtxRange("pageableStagedD2H", NvtxColor.ORANGE);
-      long recordStart = System.nanoTime();
+      long recordStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
       ready.record(stream);
-      stagedCopyRecordEventNs.addAndGet(System.nanoTime() - recordStart);
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyRecordEventNs.addAndGet(System.nanoTime() - recordStart);
+      }
       if (asyncStagedD2H) {
         copyFromDeviceAsync(dst.address + dstOffset, src.address + srcOffset, length, ready);
         return true;
       }
       int chunks = (int) Math.min(stagedCopyThreads,
           (length + stagedCopyChunkSize - 1) / stagedCopyChunkSize);
-      stagedCopyChunks.addAndGet(chunks);
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyChunks.addAndGet(chunks);
+      }
       List<Future<?>> futures = new ArrayList<>(chunks);
       long remaining = length;
       long copyOffset = 0;
-      long submitStart = System.nanoTime();
+      long submitStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
       final String destinationSource = dst.cleaner instanceof PageableHostBufferCleaner ?
           "pool" : dst.cleaner instanceof RawStagedHostBufferCleaner ? "raw" : "other";
       try {
@@ -853,13 +904,22 @@ public final class PageableMemoryPool implements AutoCloseable {
           long dstAddress = dst.address + dstOffset + copyOffset;
           long srcAddress = src.address + srcOffset + copyOffset;
           long waitEvent = ready.getEvent();
-          long queuedAt = System.nanoTime();
+          long queuedAt = (STAGED_COPY_STATS_ENABLED || TRACE_STAGED_COPY_CHUNKS) ?
+              System.nanoTime() : 0;
           futures.add(executor.submit(() -> {
-            long queueNs = System.nanoTime() - queuedAt;
-            stagedCopyQueueNs.addAndGet(queueNs);
-            updateMax(stagedCopyMaxQueueNs, queueNs);
-            long active = stagedCopyWorkerActive.incrementAndGet();
-            updateMax(stagedCopyMaxWorkerActive, active);
+            long queueNs = (STAGED_COPY_STATS_ENABLED || TRACE_STAGED_COPY_CHUNKS) ?
+                System.nanoTime() - queuedAt : 0;
+            if (STAGED_COPY_STATS_ENABLED) {
+              stagedCopyQueueNs.addAndGet(queueNs);
+            }
+            if (STAGED_COPY_STATS_ENABLED) {
+              updateMax(stagedCopyMaxQueueNs, queueNs);
+            }
+            long active = STAGED_COPY_STATS_ENABLED ?
+                stagedCopyWorkerActive.incrementAndGet() : 0;
+            if (STAGED_COPY_STATS_ENABLED) {
+              updateMax(stagedCopyMaxWorkerActive, active);
+            }
             try (NvtxRange chunkRange =
                      new NvtxRange(TRACE_STAGED_COPY_CHUNKS ?
                          "pageableStagedD2HChunk source=" + destinationSource +
@@ -867,29 +927,39 @@ public final class PageableMemoryPool implements AutoCloseable {
                          "pageableStagedD2HChunk", NvtxColor.YELLOW)) {
               stagedCopyFromDevice(dstAddress, srcAddress, chunk, waitEvent);
             } finally {
-              stagedCopyWorkerActive.decrementAndGet();
+              if (STAGED_COPY_STATS_ENABLED) {
+                stagedCopyWorkerActive.decrementAndGet();
+              }
             }
           }));
           copyOffset += chunk;
           remaining -= chunk;
         }
       } finally {
-        stagedCopySubmitNs.addAndGet(System.nanoTime() - submitStart);
-        long waitStart = System.nanoTime();
+        if (STAGED_COPY_STATS_ENABLED) {
+          stagedCopySubmitNs.addAndGet(System.nanoTime() - submitStart);
+        }
+        long waitStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
         waitForStagedCopies(futures);
-        stagedCopyWaitNs.addAndGet(System.nanoTime() - waitStart);
+        if (STAGED_COPY_STATS_ENABLED) {
+          stagedCopyWaitNs.addAndGet(System.nanoTime() - waitStart);
+        }
       }
       return true;
     } finally {
-      stagedCopyTotalNs.addAndGet(System.nanoTime() - totalStart);
-      stagedCopyInFlight.decrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyTotalNs.addAndGet(System.nanoTime() - totalStart);
+      }
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyInFlight.decrementAndGet();
+      }
       if (ready != null) {
         ready.close();
       }
       if (stagedRange != null) {
         stagedRange.close();
       }
-      if (callNumber == 1 || callNumber % 100 == 0) {
+      if (STAGED_COPY_STATS_ENABLED && (callNumber == 1 || callNumber % 100 == 0)) {
         logStagedCopyStats();
       }
     }
@@ -919,60 +989,90 @@ public final class PageableMemoryPool implements AutoCloseable {
       return false;
     }
     if (!explicitStage && Boolean.getBoolean("ai.rapids.cudf.pageable.staged.copy.h2d.disabled")) {
-      stagedCopySkippedDisabledCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedDisabledCount.incrementAndGet();
+      }
       return false;
     }
     if (!explicitStage && Boolean.getBoolean("ai.rapids.cudf.pageable.staged.copy.disabled")) {
-      stagedCopySkippedDisabledCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedDisabledCount.incrementAndGet();
+      }
       return false;
     }
     if (!isPageablePoolBuffer(src)) {
-      stagedCopySkippedNonPoolCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedNonPoolCount.incrementAndGet();
+      }
       return false;
     }
     if (!explicitStage && length < stagedCopyMinSize) {
-      stagedCopySkippedSmallCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedSmallCount.incrementAndGet();
+      }
       return false;
     }
     ExecutorService executor = stagedCopyExecutor;
     if (executor == null) {
-      stagedCopySkippedNoExecutorCount.incrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopySkippedNoExecutorCount.incrementAndGet();
+      }
       return false;
     }
-    long totalStart = System.nanoTime();
-    long inFlight = stagedCopyInFlight.incrementAndGet();
-    updateMax(stagedCopyMaxInFlight, inFlight);
-    long callNumber = stagedCopyCallCount.incrementAndGet();
-    stagedH2DCalls.incrementAndGet();
-    stagedH2DBytes.addAndGet(length);
-    stagedCopyBytes.addAndGet(length);
-    updateMax(stagedCopyMaxBytes, length);
+    long totalStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
+    long inFlight = STAGED_COPY_STATS_ENABLED ? stagedCopyInFlight.incrementAndGet() : 0;
+    if (STAGED_COPY_STATS_ENABLED) {
+      updateMax(stagedCopyMaxInFlight, inFlight);
+    }
+    long callNumber = STAGED_COPY_STATS_ENABLED ? stagedCopyCallCount.incrementAndGet() : 0;
+    if (STAGED_COPY_STATS_ENABLED) {
+      stagedH2DCalls.incrementAndGet();
+    }
+    if (STAGED_COPY_STATS_ENABLED) {
+      stagedH2DBytes.addAndGet(length);
+    }
+    if (STAGED_COPY_STATS_ENABLED) {
+      stagedCopyBytes.addAndGet(length);
+    }
+    if (STAGED_COPY_STATS_ENABLED) {
+      updateMax(stagedCopyMaxBytes, length);
+    }
     Cuda.Event ready = null;
     NvtxRange stagedRange = null;
     try {
       ready = new Cuda.Event(false, true);
       stagedRange = new NvtxRange("pageableStagedH2D", NvtxColor.CYAN);
-      long recordStart = System.nanoTime();
+      long recordStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
       ready.record(stream);
-      stagedCopyRecordEventNs.addAndGet(System.nanoTime() - recordStart);
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyRecordEventNs.addAndGet(System.nanoTime() - recordStart);
+      }
       int chunks = (int) Math.min(stagedCopyThreads,
           (length + stagedCopyChunkSize - 1) / stagedCopyChunkSize);
-      stagedCopyChunks.addAndGet(chunks);
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyChunks.addAndGet(chunks);
+      }
       List<Future<?>> futures = new ArrayList<>(chunks);
       long remaining = length;
       long copyOffset = 0;
-      long submitStart = System.nanoTime();
+      long submitStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
       try {
         while (remaining > 0) {
           long chunk = Math.min(stagedCopyChunkSize, remaining);
           long dstAddress = dst.address + dstOffset + copyOffset;
           long srcAddress = src.address + srcOffset + copyOffset;
           long waitEvent = ready.getEvent();
-          long queuedAt = System.nanoTime();
+          long queuedAt = (STAGED_COPY_STATS_ENABLED || TRACE_STAGED_COPY_CHUNKS) ?
+              System.nanoTime() : 0;
           futures.add(executor.submit(() -> {
-            long queueNs = System.nanoTime() - queuedAt;
-            stagedCopyQueueNs.addAndGet(queueNs);
-            updateMax(stagedCopyMaxQueueNs, queueNs);
+            long queueNs = (STAGED_COPY_STATS_ENABLED || TRACE_STAGED_COPY_CHUNKS) ?
+                System.nanoTime() - queuedAt : 0;
+            if (STAGED_COPY_STATS_ENABLED) {
+              stagedCopyQueueNs.addAndGet(queueNs);
+            }
+            if (STAGED_COPY_STATS_ENABLED) {
+              updateMax(stagedCopyMaxQueueNs, queueNs);
+            }
             try (NvtxRange chunkRange =
                      new NvtxRange(TRACE_STAGED_COPY_CHUNKS ?
                          "pageableStagedH2DChunk source=pool bytes=" + chunk +
@@ -985,22 +1085,30 @@ public final class PageableMemoryPool implements AutoCloseable {
           remaining -= chunk;
         }
       } finally {
-        stagedCopySubmitNs.addAndGet(System.nanoTime() - submitStart);
-        long waitStart = System.nanoTime();
+        if (STAGED_COPY_STATS_ENABLED) {
+          stagedCopySubmitNs.addAndGet(System.nanoTime() - submitStart);
+        }
+        long waitStart = STAGED_COPY_STATS_ENABLED ? System.nanoTime() : 0;
         waitForStagedCopies(futures);
-        stagedCopyWaitNs.addAndGet(System.nanoTime() - waitStart);
+        if (STAGED_COPY_STATS_ENABLED) {
+          stagedCopyWaitNs.addAndGet(System.nanoTime() - waitStart);
+        }
       }
       return true;
     } finally {
-      stagedCopyTotalNs.addAndGet(System.nanoTime() - totalStart);
-      stagedCopyInFlight.decrementAndGet();
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyTotalNs.addAndGet(System.nanoTime() - totalStart);
+      }
+      if (STAGED_COPY_STATS_ENABLED) {
+        stagedCopyInFlight.decrementAndGet();
+      }
       if (ready != null) {
         ready.close();
       }
       if (stagedRange != null) {
         stagedRange.close();
       }
-      if (callNumber == 1 || callNumber % 100 == 0) {
+      if (STAGED_COPY_STATS_ENABLED && (callNumber == 1 || callNumber % 100 == 0)) {
         logStagedCopyStats();
       }
     }
@@ -1017,7 +1125,7 @@ public final class PageableMemoryPool implements AutoCloseable {
   }
 
   public static void logStagedCopyStats() {
-    if (!Boolean.getBoolean("ai.rapids.cudf.pageable.staged.copy.stats.log.enabled")) {
+    if (!STAGED_COPY_STATS_ENABLED) {
       return;
     }
     long calls = stagedCopyCallCount.getAndSet(0);

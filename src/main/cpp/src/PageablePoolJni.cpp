@@ -76,6 +76,7 @@ struct staged_copy_stats {
 };
 
 staged_copy_stats stats;
+std::atomic<bool> stats_enabled{false};
 
 void update_max(std::atomic<std::uint64_t>& max_value, std::uint64_t value)
 {
@@ -102,6 +103,21 @@ class thread_local_staging_buffer {
   void copy_from_device(void* dst, void const* src, std::size_t size, cudaEvent_t wait_event)
   {
     if (size == 0) { return; }
+    if (!stats_enabled.load(std::memory_order_relaxed)) {
+      ensure_capacity(size);
+      ensure_stream();
+      CUDF_CUDA_TRY(cudaStreamWaitEvent(stream_, wait_event, 0));
+      {
+        nvtx3::scoped_range_in<spark_rapids_jni::srj_domain> range{"stagedD2HGpuCopySync"};
+        CUDF_CUDA_TRY(cudaMemcpyAsync(buffer_, src, size, cudaMemcpyDeviceToHost, stream_));
+        CUDF_CUDA_TRY(cudaStreamSynchronize(stream_));
+      }
+      {
+        nvtx3::scoped_range_in<spark_rapids_jni::srj_domain> range{"stagedD2HHostMemcpy"};
+        std::memcpy(dst, buffer_, size);
+      }
+      return;
+    }
     auto const total_start = clock_type::now();
     stats.calls.fetch_add(1, std::memory_order_relaxed);
     stats.bytes.fetch_add(size, std::memory_order_relaxed);
@@ -147,6 +163,15 @@ class thread_local_staging_buffer {
   void copy_to_device(void* dst, void const* src, std::size_t size, cudaEvent_t wait_event)
   {
     if (size == 0) { return; }
+    if (!stats_enabled.load(std::memory_order_relaxed)) {
+      ensure_capacity(size);
+      ensure_stream();
+      CUDF_CUDA_TRY(cudaStreamWaitEvent(stream_, wait_event, 0));
+      std::memcpy(buffer_, src, size);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(dst, buffer_, size, cudaMemcpyHostToDevice, stream_));
+      CUDF_CUDA_TRY(cudaStreamSynchronize(stream_));
+      return;
+    }
     auto const total_start = clock_type::now();
     stats.calls.fetch_add(1, std::memory_order_relaxed);
     stats.bytes.fetch_add(size, std::memory_order_relaxed);
@@ -181,7 +206,9 @@ class thread_local_staging_buffer {
   {
     if (stream_ == nullptr) {
       CUDF_CUDA_TRY(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-      stats.stream_create_calls.fetch_add(1, std::memory_order_relaxed);
+      if (stats_enabled.load(std::memory_order_relaxed)) {
+        stats.stream_create_calls.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 
@@ -195,6 +222,12 @@ thread_local thread_local_staging_buffer staging_buffer;
 }  // namespace
 
 extern "C" {
+
+JNIEXPORT void JNICALL Java_ai_rapids_cudf_PageableMemoryPool_setStagedCopyStatsEnabled(
+  JNIEnv*, jclass, jboolean enabled)
+{
+  stats_enabled.store(enabled != JNI_FALSE, std::memory_order_relaxed);
+}
 
 JNIEXPORT jlong JNICALL
 Java_ai_rapids_cudf_PageableMemoryPool_newPageablePoolMemoryResource(JNIEnv* env,
@@ -298,6 +331,12 @@ JNIEXPORT void JNICALL Java_ai_rapids_cudf_PageableMemoryPool_stagedHostCopy(
   JNI_ARG_CHECK(env, jsrc != 0, "src memory pointer is null", );
   JNI_TRY
   {
+    if (!stats_enabled.load(std::memory_order_relaxed)) {
+      nvtx3::scoped_range_in<spark_rapids_jni::srj_domain> range{"stagedD2HHostMemcpy"};
+      std::memcpy(reinterpret_cast<void*>(jdst), reinterpret_cast<void const*>(jsrc),
+                  static_cast<std::size_t>(jsize));
+      return;
+    }
     auto const start = clock_type::now();
     stats.calls.fetch_add(1, std::memory_order_relaxed);
     stats.bytes.fetch_add(jsize, std::memory_order_relaxed);
