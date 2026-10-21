@@ -48,6 +48,176 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class PageableAsyncD2HLifecycleTest {
   @Test
+  public void interruptedSlotWaitLeavesCapacityIntact() throws Exception {
+    configureAsyncPool(1);
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
+    ArrayBlockingQueue<Object> free = null;
+    Object held = null;
+    Thread caller = null;
+    try {
+      PageableMemoryPool.initialize(8192, 1);
+      assertTrue(PageableMemoryPool.isInitialized());
+      @SuppressWarnings("unchecked")
+      ArrayBlockingQueue<Object> slots =
+          (ArrayBlockingQueue<Object>) field("freeAsyncD2HSlots").get(null);
+      free = slots;
+      held = free.poll();
+      assertNotNull(held);
+      List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+      CountDownLatch started = new CountDownLatch(1);
+      try (DeviceMemoryBuffer device = DeviceMemoryBuffer.allocate(4096);
+           HostMemoryBuffer host = PageableMemoryPool.allocateRawForDeviceToHost(4096)) {
+        caller = new Thread(() -> {
+          started.countDown();
+          try {
+            PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+                Cuda.DEFAULT_STREAM);
+          } catch (Throwable t) {
+            failures.add(t);
+          }
+        }, "interrupted D2H slot waiter");
+        caller.start();
+        assertTrue(started.await(5, TimeUnit.SECONDS));
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (caller.getState() != Thread.State.TIMED_WAITING &&
+            System.nanoTime() < deadline) {
+          Thread.yield();
+        }
+        assertEquals(Thread.State.TIMED_WAITING, caller.getState());
+        caller.interrupt();
+        caller.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse(caller.isAlive());
+        assertEquals(1, failures.size());
+        assertTrue(hasCause(failures.get(0), InterruptedException.class));
+        free.add(held);
+        held = null;
+        PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+            Cuda.DEFAULT_STREAM);
+        assertEquals(1, free.size());
+      }
+    } finally {
+      if (held != null && free != null) {
+        free.add(held);
+      }
+      if (caller != null) {
+        caller.interrupt();
+        caller.join(TimeUnit.SECONDS.toMillis(5));
+      }
+      PageableMemoryPool.shutdown();
+      Rmm.shutdown();
+      clearAsyncPoolConfig();
+    }
+  }
+
+  @Test
+  public void failedEventQueryAndSynchronizationsQuarantineSlot() throws Exception {
+    configureAsyncPool(1);
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
+    Field query = field("asyncD2HEventQueryOverride");
+    Field streamSync = field("beforeAsyncD2HStreamSync");
+    Field deviceSync = field("beforeAsyncD2HDeviceSync");
+    try {
+      PageableMemoryPool.initialize(8192, 1);
+      assertTrue(PageableMemoryPool.isInitialized());
+      query.set(null, (BooleanSupplier) () -> {
+        throw new IllegalStateException("injected event query failure");
+      });
+      streamSync.set(null, (Runnable) () -> {
+        throw new IllegalStateException("injected stream sync failure");
+      });
+      deviceSync.set(null, (Runnable) () -> {
+        throw new IllegalStateException("injected device sync failure");
+      });
+      ArrayBlockingQueue<?> free = (ArrayBlockingQueue<?>) field("freeAsyncD2HSlots").get(null);
+      try (DeviceMemoryBuffer device = DeviceMemoryBuffer.allocate(4096);
+           HostMemoryBuffer host = PageableMemoryPool.allocateRawForDeviceToHost(4096)) {
+        RuntimeException failure = assertThrows(RuntimeException.class,
+            () -> PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+                Cuda.DEFAULT_STREAM));
+        assertEquals(2, failure.getCause().getSuppressed().length);
+        assertEquals(0, free.size(), "uncertain DMA returned an unsafe slot");
+        assertThrows(IllegalStateException.class,
+            () -> PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+                Cuda.DEFAULT_STREAM));
+      }
+    } finally {
+      query.set(null, null);
+      streamSync.set(null, null);
+      deviceSync.set(null, null);
+      PageableMemoryPool.shutdown();
+      Rmm.shutdown();
+      clearAsyncPoolConfig();
+    }
+  }
+
+  @Test
+  public void shutdownWaitsForPendingCudaCopy() throws Exception {
+    configureAsyncPool(1);
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
+    Field query = field("asyncD2HEventQueryOverride");
+    CountDownLatch polling = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    Thread caller = null;
+    Thread shutdown = null;
+    try {
+      PageableMemoryPool.initialize(8192, 1);
+      assertTrue(PageableMemoryPool.isInitialized());
+      query.set(null, (BooleanSupplier) () -> {
+        polling.countDown();
+        try {
+          release.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new RuntimeException(e);
+        }
+        return false;
+      });
+      List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+      try (DeviceMemoryBuffer device = DeviceMemoryBuffer.allocate(4096);
+           HostMemoryBuffer host = PageableMemoryPool.allocateRawForDeviceToHost(4096)) {
+        caller = new Thread(() -> {
+          try {
+            PageableMemoryPool.copyDeviceToPageableHost(host, 0, device, 0, 4096,
+                Cuda.DEFAULT_STREAM);
+          } catch (Throwable t) {
+            failures.add(t);
+          }
+        }, "pending CUDA D2H caller");
+        caller.start();
+        assertTrue(polling.await(5, TimeUnit.SECONDS));
+        shutdown = new Thread(() -> {
+          try {
+            PageableMemoryPool.shutdown();
+          } catch (Throwable t) {
+            failures.add(t);
+          }
+        }, "pending CUDA D2H shutdown");
+        shutdown.start();
+        assertTrue(shutdown.isAlive());
+        query.set(null, null);
+        release.countDown();
+        caller.join(TimeUnit.SECONDS.toMillis(5));
+        shutdown.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse(caller.isAlive());
+        assertFalse(shutdown.isAlive());
+        assertTrue(failures.isEmpty(), () -> "copy failures: " + failures);
+      }
+    } finally {
+      query.set(null, null);
+      release.countDown();
+      if (caller != null) {
+        caller.join(TimeUnit.SECONDS.toMillis(5));
+      }
+      if (shutdown != null) {
+        shutdown.join(TimeUnit.SECONDS.toMillis(5));
+      }
+      PageableMemoryPool.shutdown();
+      Rmm.shutdown();
+      clearAsyncPoolConfig();
+    }
+  }
+
+  @Test
   public void eventQueryFailureDrainsAndReturnsSlot() throws Exception {
     configureAsyncPool(1);
     Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 64L * 1024 * 1024);
@@ -161,6 +331,8 @@ public class PageableAsyncD2HLifecycleTest {
       Field allSlotsField = PageableMemoryPool.class.getDeclaredField("asyncD2HSlots");
       allSlotsField.setAccessible(true);
       assertEquals(1, ((List<?>) allSlotsField.get(null)).size());
+      // Registration is fixed at initialization: one worker buffer plus one async slot.
+      assertEquals(1, ((long[]) field("registeredStagedCopyBuffers").get(null)).length);
       CountDownLatch workerBlocked = new CountDownLatch(1);
       workers.submit(() -> {
         workerBlocked.countDown();

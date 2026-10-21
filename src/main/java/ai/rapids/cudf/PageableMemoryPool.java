@@ -71,6 +71,8 @@ public final class PageableMemoryPool implements AutoCloseable {
   // cannot replace (Runtime API return codes are not supported by that injector).
   private static volatile Runnable beforeRegisteredStagingAllocation = null;
   private static volatile BooleanSupplier asyncD2HEventQueryOverride = null;
+  private static volatile Runnable beforeAsyncD2HStreamSync = null;
+  private static volatile Runnable beforeAsyncD2HDeviceSync = null;
   private static final AtomicLong stagedCopyCallCount = new AtomicLong();
   private static final AtomicLong stagedD2HCalls = new AtomicLong();
   private static final AtomicLong stagedD2HBytes = new AtomicLong();
@@ -150,6 +152,7 @@ public final class PageableMemoryPool implements AutoCloseable {
     final long address;
     final Cuda.Stream stream;
     final Cuda.Event done;
+    volatile boolean quarantined;
 
     AsyncD2HSlot(long address) {
       this.address = address;
@@ -501,6 +504,12 @@ public final class PageableMemoryPool implements AutoCloseable {
     pendingAsyncD2H = null;
     if (slots != null) {
       for (AsyncD2HSlot slot : slots) {
+        if (slot.quarantined && !drainAsyncD2HSlot(slot,
+            new IllegalStateException("Unable to drain quarantined D2H slot at shutdown"))) {
+          // Its DMA may still use the registered allocation. Retain it until process exit.
+          log.error("Unable to safely release a quarantined staged D2H slot");
+          continue;
+        }
         slot.close();
       }
     }
@@ -565,27 +574,40 @@ public final class PageableMemoryPool implements AutoCloseable {
 
   private static void failAsyncD2HCopy(PendingAsyncD2H copy, Throwable failure,
       boolean streamMayBeActive) {
-    boolean drained = !streamMayBeActive;
-    if (streamMayBeActive) {
-      // A failed event query does not establish that the DMA is finished.
-      try {
-        copy.slot.stream.sync();
-        drained = true;
-      } catch (RuntimeException | Error syncFailure) {
-        failure.addSuppressed(syncFailure);
-        try {
-          Cuda.deviceSynchronize();
-          drained = true;
-        } catch (RuntimeException | Error deviceFailure) {
-          failure.addSuppressed(deviceFailure);
-        }
-      }
-    }
+    boolean drained = !streamMayBeActive || drainAsyncD2HSlot(copy.slot, failure);
     asyncD2HFailure = failure;
     if (drained) {
       freeAsyncD2HSlots.add(copy.slot);
     }
     copy.future.completeExceptionally(failure);
+  }
+
+  private static boolean drainAsyncD2HSlot(AsyncD2HSlot slot, Throwable failure) {
+    // An event-query error does not prove that the DMA has finished.
+    try {
+      Runnable hook = beforeAsyncD2HStreamSync;
+      if (hook != null) {
+        hook.run();
+      }
+      slot.stream.sync();
+      slot.quarantined = false;
+      return true;
+    } catch (RuntimeException | Error syncFailure) {
+      failure.addSuppressed(syncFailure);
+      try {
+        Runnable hook = beforeAsyncD2HDeviceSync;
+        if (hook != null) {
+          hook.run();
+        }
+        Cuda.deviceSynchronize();
+        slot.quarantined = false;
+        return true;
+      } catch (RuntimeException | Error deviceFailure) {
+        failure.addSuppressed(deviceFailure);
+        slot.quarantined = true;
+        return false;
+      }
+    }
   }
 
   private static void copyFromDeviceAsync(long dst, long src, long length, Cuda.Event ready) {
@@ -629,10 +651,10 @@ public final class PageableMemoryPool implements AutoCloseable {
           LockSupport.unpark(asyncD2HPoller);
           futures.add(future);
         } catch (RuntimeException | Error t) {
-          try {
-            slot.stream.sync();
-          } finally {
+          if (drainAsyncD2HSlot(slot, t)) {
             free.add(slot);
+          } else {
+            asyncD2HFailure = t;
           }
           throw t;
         }
