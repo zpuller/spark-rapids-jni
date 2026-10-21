@@ -267,7 +267,9 @@ public class PageableSpillCopyTest {
         try (HostMemoryBuffer staged =
                  PageableMemoryPool.tryAllocateForDeviceToHost(length)) {
           assertNotNull(staged);
+          long callsBefore = stagedCalls();
           staged.copyFromDeviceBufferAsync(device, Cuda.DEFAULT_STREAM);
+          assertEquals(callsBefore + 1, stagedCalls());
           byte[] automatic = new byte[length];
           staged.getBytes(automatic, 0, 0, length);
           assertArrayEquals(expected, automatic);
