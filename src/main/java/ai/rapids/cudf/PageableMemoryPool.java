@@ -413,6 +413,7 @@ public final class PageableMemoryPool implements AutoCloseable {
     initThread.setDaemon(true);
     initThread.start();
     initFuture = task;
+    HostMemoryBuffer.setDeviceToHostCopyHandler(PageableMemoryPool::copyFromDeviceBuffer);
   }
 
   /**
@@ -455,6 +456,7 @@ public final class PageableMemoryPool implements AutoCloseable {
       singleton_ = null;
       asyncStagedD2H = false;
     } finally {
+      HostMemoryBuffer.setDeviceToHostCopyHandler(null);
       stagedCopyLifecycleLock.writeLock().unlock();
     }
   }
