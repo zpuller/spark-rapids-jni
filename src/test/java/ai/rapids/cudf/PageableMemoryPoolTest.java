@@ -17,9 +17,13 @@
 package ai.rapids.cudf;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -68,6 +72,89 @@ public class PageableMemoryPoolTest {
   public void rejectsInvalidAllocationSize() {
     assertThrows(IllegalArgumentException.class, () -> PageableMemoryPool.tryAllocate(0));
     assertThrows(IllegalArgumentException.class, () -> PageableMemoryPool.tryAllocate(-1));
+  }
+
+  @Test
+  public void interruptedCopyWaitDrainsEveryWorkerBeforeReturning() throws Exception {
+    CountDownLatch waiting = new CountDownLatch(1);
+    CountDownLatch sawInterrupt = new CountDownLatch(1);
+    CompletableFuture<Void> first = new CompletableFuture<Void>() {
+      @Override
+      public Void get() throws InterruptedException, ExecutionException {
+        waiting.countDown();
+        try {
+          return super.get();
+        } catch (InterruptedException e) {
+          sawInterrupt.countDown();
+          throw e;
+        }
+      }
+    };
+    CountDownLatch waitingForSecond = new CountDownLatch(1);
+    CompletableFuture<Void> second = new CompletableFuture<Void>() {
+      @Override
+      public Void get() throws InterruptedException, ExecutionException {
+        waitingForSecond.countDown();
+        return super.get();
+      }
+    };
+    AtomicBoolean interruptedOnReturn = new AtomicBoolean(false);
+    AtomicBoolean returned = new AtomicBoolean(false);
+    List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+    Thread caller = new Thread(() -> {
+      try {
+        PageableMemoryPool.waitForStagedCopies(Arrays.<Future<?>>asList(first, second));
+      } catch (RuntimeException expected) {
+        failures.add(expected.getCause());
+      } finally {
+        interruptedOnReturn.set(Thread.currentThread().isInterrupted());
+        returned.set(true);
+      }
+    });
+    caller.start();
+    assertTrue(waiting.await(5, TimeUnit.SECONDS));
+    caller.interrupt();
+    assertTrue(sawInterrupt.await(5, TimeUnit.SECONDS));
+    first.complete(null);
+    assertTrue(waitingForSecond.await(5, TimeUnit.SECONDS));
+    assertFalse(returned.get(), "caller returned before the second worker finished");
+    second.complete(null);
+    caller.join(TimeUnit.SECONDS.toMillis(5));
+    assertFalse(caller.isAlive());
+    assertTrue(interruptedOnReturn.get());
+    assertEquals(1, failures.size());
+    assertTrue(failures.get(0) instanceof InterruptedException);
+  }
+
+  @Test
+  public void failedCopyWaitDrainsOtherWorkersBeforeReturning() throws Exception {
+    CompletableFuture<Void> failed = new CompletableFuture<>();
+    CompletableFuture<Void> pending = new CompletableFuture<>();
+    CountDownLatch waitingForPending = new CountDownLatch(1);
+    CompletableFuture<Void> observedPending = new CompletableFuture<Void>() {
+      @Override
+      public Void get() throws InterruptedException, ExecutionException {
+        waitingForPending.countDown();
+        return pending.get();
+      }
+    };
+    AtomicBoolean returned = new AtomicBoolean(false);
+    Thread caller = new Thread(() -> {
+      try {
+        PageableMemoryPool.waitForStagedCopies(
+            Arrays.<Future<?>>asList(failed, observedPending));
+      } catch (RuntimeException expected) {
+        returned.set(true);
+      }
+    });
+    failed.completeExceptionally(new IllegalStateException("injected worker failure"));
+    caller.start();
+    assertTrue(waitingForPending.await(5, TimeUnit.SECONDS));
+    assertFalse(returned.get(), "caller returned while another worker was active");
+    pending.complete(null);
+    caller.join(TimeUnit.SECONDS.toMillis(5));
+    assertFalse(caller.isAlive());
+    assertTrue(returned.get());
   }
 
   @Test
